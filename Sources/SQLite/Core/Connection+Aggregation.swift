@@ -62,8 +62,15 @@ extension Connection {
                 }
                 step(arguments, mutablePointer.pointee.assumingMemoryBound(to: T.self))
             } else {
-                let result = final(mutablePointer.pointee.assumingMemoryBound(to: T.self))
-                context.set(result: result)
+                // Check if xStep was ever called (state was initialized)
+                // SQLite may call xFinal without xStep for empty result sets
+                if aggregateContext.assumingMemoryBound(to: Int64.self).pointee == 0 {
+                    // No rows processed - return nil (SQL NULL)
+                    context.set(result: nil)
+                } else {
+                    let result = final(mutablePointer.pointee.assumingMemoryBound(to: T.self))
+                    context.set(result: result)
+                }
             }
         }
 
