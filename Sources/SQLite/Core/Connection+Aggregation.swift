@@ -101,7 +101,7 @@ extension Connection {
             _ aggregate: String,
             argumentCount: UInt? = nil,
             deterministic: Bool = false,
-            initialValue: T,
+            initialValue: @autoclosure @escaping () -> T,
             reduce: @escaping (T, [Binding?]) -> T,
             result: @escaping (T) -> Binding?
     ) {
@@ -122,7 +122,7 @@ extension Connection {
 
         let state: () -> UnsafeMutablePointer<UnsafeMutableRawPointer> = {
             let pointer = UnsafeMutablePointer<UnsafeMutableRawPointer>.allocate(capacity: 1)
-            pointer.pointee = Unmanaged.passRetained(initialValue).toOpaque()
+            pointer.pointee = Unmanaged.passRetained(initialValue()).toOpaque()
             return pointer
         }
 
@@ -133,7 +133,7 @@ extension Connection {
             _ aggregate: String,
             argumentCount: UInt? = nil,
             deterministic: Bool = false,
-            initialValue: T,
+            initialValue: @autoclosure @escaping () -> T,
             reduce: @escaping (T, [Binding?]) -> T,
             result: @escaping (T) -> Binding?
     ) {
@@ -152,7 +152,7 @@ extension Connection {
 
         let state: () -> UnsafeMutablePointer<T> = {
             let pointer = UnsafeMutablePointer<T>.allocate(capacity: 1)
-            pointer.initialize(to: initialValue)
+            pointer.initialize(to: initialValue())
             return pointer
         }
 
