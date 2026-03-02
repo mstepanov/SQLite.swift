@@ -31,8 +31,11 @@ public struct Blob: Sendable {
     }
 
     public init(bytes: UnsafeRawPointer, length: Int) {
-        let i8bufptr = UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: UInt8.self), count: length)
-        self.init(bytes: [UInt8](i8bufptr))
+        // Use UnsafeRawBufferPointer to copy bytes safely without assuming memory binding.
+        // SQLite's internal blob memory may not be properly "bound" in Swift's type system,
+        // and assumingMemoryBound followed by Array.init can trigger "overlapping range" errors.
+        let rawBuffer = UnsafeRawBufferPointer(start: bytes, count: length)
+        self.init(bytes: Array(rawBuffer))
     }
 
     public func toHex() -> String {
