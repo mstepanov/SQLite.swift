@@ -23,6 +23,7 @@
 //
 
 import Foundation
+import SQLiteVtabHelper
 
 #if SQLITE_SWIFT_STANDALONE
 import sqlite3
@@ -91,30 +92,44 @@ extension Connection {
                     return
                 }
                 try typedModule.destroy()
+            },
+            update: { module, arguments in
+                guard let typedModule = module as? M else {
+                    throw VirtualTableError.invalidArgument("Module type mismatch")
+                }
+                return try typedModule.update(arguments)
             }
         )
         let contextPtr = Unmanaged.passRetained(context).toOpaque()
         
-        // Allocate and initialize sqlite3_module structure
-        let module = UnsafeMutablePointer<sqlite3_module>.allocate(capacity: 1)
-        
-        // Initialize with zeros first, then set required fields
-        module.pointee = sqlite3_module()
-        module.pointee.iVersion = 2
-        module.pointee.xCreate = vtabCreateCallback
-        module.pointee.xConnect = vtabConnectCallback
-        module.pointee.xBestIndex = vtabBestIndexCallback
-        module.pointee.xDisconnect = vtabDisconnectCallback
-        module.pointee.xDestroy = vtabDestroyCallback
-        module.pointee.xOpen = vtabOpenCallback
-        module.pointee.xClose = vtabCloseCallback
-        module.pointee.xFilter = vtabFilterCallback
-        module.pointee.xNext = vtabNextCallback
-        module.pointee.xEof = vtabEofCallback
-        module.pointee.xColumn = vtabColumnCallback
-        module.pointee.xRowid = vtabRowidCallback
-        // Read-only table: xUpdate, xBegin, xSync, xCommit, xRollback are nil (default)
-        // Optional callbacks: xFindFunction, xRename, xSavepoint, xRelease, xRollbackTo, xShadowName are nil (default)
+        // Allocate and initialize sqlite3_module structure using C shim.
+        //
+        // IMPORTANT: We use a C helper function (sqlite_vtab_create_module) to
+        // construct the sqlite3_module struct rather than setting fields
+        // individually from Swift. This avoids a struct field offset mismatch
+        // between Swift's imported view of sqlite3_module and the actual C
+        // layout — particularly for xUpdate, where a misaligned write causes
+        // SQLite to see NULL and return SQLITE_READONLY ("table may not be
+        // modified"). The C compiler guarantees correct field offsets.
+        guard let module = sqlite_vtab_create_module(
+            2,  // iVersion
+            vtabCreateCallback,
+            vtabConnectCallback,
+            vtabBestIndexCallback,
+            vtabDisconnectCallback,
+            vtabDestroyCallback,
+            vtabOpenCallback,
+            vtabCloseCallback,
+            vtabFilterCallback,
+            vtabNextCallback,
+            vtabEofCallback,
+            vtabColumnCallback,
+            vtabRowidCallback,
+            vtabUpdateCallback
+        ) else {
+            Unmanaged<VirtualTableModuleContext>.fromOpaque(contextPtr).release()
+            throw Result.error(message: "Failed to allocate sqlite3_module", code: SQLITE_NOMEM, statement: nil)
+        }
         
         // Register module with SQLite
         let result = sqlite3_create_module_v2(
@@ -173,6 +188,9 @@ typealias VirtualTableBestIndexFunc = (AnyObject, inout VirtualTableIndexInfo) -
 /// Function to destroy module
 typealias VirtualTableDestroyFunc = (AnyObject) throws -> Void
 
+/// Function to handle INSERT/DELETE/UPDATE on module
+typealias VirtualTableUpdateFunc = (AnyObject, [Binding?]) throws -> Int64
+
 // MARK: - Context Types
 
 /// Context for module registration (type-erased)
@@ -183,6 +201,7 @@ final class VirtualTableModuleContext {
     let getColumns: VirtualTableColumnsGetter
     let bestIndex: VirtualTableBestIndexFunc
     let destroy: VirtualTableDestroyFunc
+    let update: VirtualTableUpdateFunc
     
     init(
         moduleName: String,
@@ -190,7 +209,8 @@ final class VirtualTableModuleContext {
         cursorFactory: @escaping VirtualTableCursorFactory,
         getColumns: @escaping VirtualTableColumnsGetter,
         bestIndex: @escaping VirtualTableBestIndexFunc,
-        destroy: @escaping VirtualTableDestroyFunc
+        destroy: @escaping VirtualTableDestroyFunc,
+        update: @escaping VirtualTableUpdateFunc
     ) {
         self.moduleName = moduleName
         self.factory = factory
@@ -198,6 +218,7 @@ final class VirtualTableModuleContext {
         self.getColumns = getColumns
         self.bestIndex = bestIndex
         self.destroy = destroy
+        self.update = update
     }
 }
 
@@ -341,18 +362,22 @@ private let vtabBestIndexCallback: @convention(c) (
     // Build VirtualTableIndexInfo from sqlite3_index_info
     var indexInfo = VirtualTableIndexInfo()
     
-    // Parse constraints
+    // Parse constraints.
+    // IMPORTANT: We must maintain a 1:1 mapping between indexInfo.constraints[]
+    // and pIndexInfo->aConstraint[]. If we skip constraints with unrecognized ops,
+    // the indices shift, and writing back argvIndex/omit to aConstraintUsage[i]
+    // would target the wrong constraint. So we include ALL constraints, using
+    // .eq as a fallback op for unrecognized ones (marked as unusable).
     let nConstraint = Int(pIndexInfo.pointee.nConstraint)
     if nConstraint > 0, let constraints = pIndexInfo.pointee.aConstraint {
         for i in 0..<nConstraint {
             let c = constraints[i]
-            if let op = VirtualTableIndexInfo.ConstraintOp(rawValue: c.op) {
-                indexInfo.constraints.append(VirtualTableIndexInfo.Constraint(
-                    column: c.iColumn,
-                    op: op,
-                    usable: c.usable != 0
-                ))
-            }
+            let op = VirtualTableIndexInfo.ConstraintOp(rawValue: c.op)
+            indexInfo.constraints.append(VirtualTableIndexInfo.Constraint(
+                column: c.iColumn,
+                op: op ?? .eq,
+                usable: op != nil ? (c.usable != 0) : false
+            ))
         }
     }
     
@@ -541,12 +566,14 @@ private let vtabFilterCallback: @convention(c) (
     // Parse index string
     let indexString: String? = idxStr.map { String(cString: $0) }
     
-    // Parse arguments
+    // Parse arguments from sqlite3_value pointers passed by SQLite.
+    // Each argument corresponds to a constraint with argvIndex > 0 set in bestIndex.
     var arguments: [Binding?] = []
     if let argv = argv {
         for i in 0..<Int(argc) {
             if let value = argv[i] {
-                arguments.append(extractBindingFromValue(value))
+                let binding = extractBindingFromValue(value)
+                arguments.append(binding)
             } else {
                 arguments.append(nil)
             }
@@ -641,6 +668,51 @@ private let vtabRowidCallback: @convention(c) (
     pRowid.pointee = rowid
     
     return SQLITE_OK
+}
+
+/// Called for INSERT, DELETE, UPDATE operations on the virtual table
+///
+/// xUpdate semantics (from SQLite docs):
+/// - argc == 1: DELETE row with rowid = argv[0]
+/// - argc > 1 && argv[0] == NULL: INSERT new row; argv[1] = rowid (or NULL for auto), argv[2...] = column values
+/// - argc > 1 && argv[0] != NULL: UPDATE row; argv[0] = old rowid, argv[1] = new rowid, argv[2...] = new column values
+private let vtabUpdateCallback: @convention(c) (
+    UnsafeMutablePointer<sqlite3_vtab>?,
+    Int32,
+    UnsafeMutablePointer<OpaquePointer?>?,
+    UnsafeMutablePointer<sqlite3_int64>?
+) -> Int32 = { pVTab, argc, argv, pRowid in
+    guard let pVTab = pVTab else {
+        return SQLITE_ERROR
+    }
+    
+    // Cast to our extended structure
+    let vtab = UnsafeMutableRawPointer(pVTab).assumingMemoryBound(to: SwiftVirtualTable.self)
+    let tableContext = Unmanaged<VirtualTableInstanceContext>.fromOpaque(vtab.pointee.contextPtr).takeUnretainedValue()
+    
+    // Parse arguments from sqlite3_value pointers
+    var arguments: [Binding?] = []
+    if let argv = argv {
+        for i in 0..<Int(argc) {
+            if let value = argv[i] {
+                arguments.append(extractBindingFromValue(value))
+            } else {
+                arguments.append(nil)
+            }
+        }
+    }
+    
+    do {
+        let newRowid = try tableContext.moduleContext.update(tableContext.instance, arguments)
+        // Return the new rowid for INSERT operations
+        pRowid?.pointee = newRowid
+        return SQLITE_OK
+    } catch {
+        // Set error message on the vtab structure
+        let message = error.localizedDescription
+        pVTab.pointee.zErrMsg = strdup(message)
+        return SQLITE_ERROR
+    }
 }
 
 // MARK: - Helper Functions

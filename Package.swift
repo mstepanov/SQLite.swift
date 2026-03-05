@@ -2,9 +2,25 @@
 import PackageDescription
 let applePlatforms: [PackageDescription.Platform] = [.iOS, .macOS, .watchOS, .tvOS, .visionOS]
 
+let vtabHelperTarget: Target = .target(
+    name: "SQLiteVtabHelper",
+    dependencies: [
+        .product(name: "SQLiteSwiftCSQLite",
+                 package: "CSQLite",
+                 condition: .when(traits: ["SQLiteSwiftCSQLite"])),
+        .product(name: "SQLCipher",
+                 package: "SQLCipher.swift",
+                 condition: .when(platforms: applePlatforms, traits: ["SQLCipher"]))
+    ],
+    cSettings: [
+        .define("SQLITE_HAS_CODEC", .when(platforms: applePlatforms, traits: ["SQLCipher"]))
+    ]
+)
+
 let target: Target = .target(
     name: "SQLite",
     dependencies: [
+        "SQLiteVtabHelper",
         .product(name: "SQLiteSwiftCSQLite",
                  package: "CSQLite",
                  condition: .when(traits: ["SQLiteSwiftCSQLite"])),
@@ -64,6 +80,6 @@ let package = Package(
         .package(url: "https://github.com/stephencelis/CSQLite", from: "3.50.4", traits: [.trait(name: "FTS5", condition: .when(traits: ["FTS5"]))]),
         .package(url: "https://github.com/sqlcipher/SQLCipher.swift", from: "4.11.0")
     ],
-    targets: [target, testTarget],
+    targets: [vtabHelperTarget, target, testTarget],
     swiftLanguageModes: [.v5],
 )
