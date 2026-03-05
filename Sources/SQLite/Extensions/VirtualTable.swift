@@ -95,6 +95,22 @@ public protocol VirtualTableModule: AnyObject {
     /// - Parameter indexInfo: Mutable index info to fill with optimization hints
     /// - Returns: SQLite result code
     func bestIndex(_ indexInfo: inout VirtualTableIndexInfo) -> Int32
+    
+    /// Handle INSERT, DELETE, and UPDATE operations on the virtual table.
+    ///
+    /// This method is called by SQLite's xUpdate callback. The semantics depend on the arguments:
+    ///
+    /// - **DELETE**: `arguments.count == 1`, `arguments[0]` is the rowid to delete
+    /// - **INSERT with auto rowid**: `arguments.count == nCol+2`, `arguments[0]` is nil (no old rowid),
+    ///   `arguments[1]` is nil (auto-assign rowid), `arguments[2...]` are column values
+    /// - **INSERT with explicit rowid**: Same as above but `arguments[1]` is the explicit rowid
+    /// - **UPDATE**: `arguments.count == nCol+2`, `arguments[0]` is old rowid (non-nil),
+    ///   `arguments[1]` is new rowid, `arguments[2...]` are new column values
+    ///
+    /// - Parameter arguments: Values as described above
+    /// - Returns: The rowid of the inserted row (for INSERT), or 0 for DELETE/UPDATE
+    /// - Throws: If the operation fails
+    func update(_ arguments: [Binding?]) throws -> Int64
 }
 
 // Default implementations
@@ -107,6 +123,11 @@ public extension VirtualTableModule {
         // Default: no optimization, full table scan
         indexInfo.estimatedCost = 1_000_000.0
         return SQLITE_OK
+    }
+    
+    func update(_ arguments: [Binding?]) throws -> Int64 {
+        // Default: read-only, reject all modifications
+        throw VirtualTableError.invalidArgument("Virtual table is read-only")
     }
 }
 
